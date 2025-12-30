@@ -1,0 +1,216 @@
+CREATE TABLE games (
+    game_id        VARCHAR(20) PRIMARY KEY,
+    game_date      DATE NOT NULL,
+    season         VARCHAR(9) NOT NULL, 
+
+    home_team_id   INTEGER NOT NULL,
+    away_team_id   INTEGER NOT NULL,
+
+    home_score     INTEGER NOT NULL,
+    away_score     INTEGER NOT NULL,
+
+    status         VARCHAR(20),   
+    arena          VARCHAR(100),
+
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+PRIMARY KEY game_id
+);
+
+
+CREATE TABLE team_game_stats (
+   team_id        INTEGER NOT NULL,
+   game_id        VARCHAR(20) NOT NULL,
+    is_home        BOOLEAN NOT NULL,
+
+    pts            INTEGER,
+    ast            INTEGER,
+    reb            INTEGER,
+    oreb           INTEGER,
+    dreb           INTEGER,
+    stl            INTEGER,
+    blk            INTEGER,
+    tov            INTEGER,
+    pf             INTEGER,
+
+    fgm            INTEGER,
+    fga            INTEGER,
+    fg_pct         DECIMAL(5,3),
+    fg3m           INTEGER,
+    fg3a           INTEGER,
+    fg3_pct        DECIMAL(5,3),
+    ftm            INTEGER,
+    fta            INTEGER,
+    ft_pct         DECIMAL(5,3),
+
+    plus_minus     INTEGER,
+    pace           DECIMAL(6,2),
+    off_rating     DECIMAL(6,2),
+    def_rating     DECIMAL(6,2),
+    net_rating     DECIMAL(6,2),
+
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY team_id,
+    FOREIGN KEY game_id REFERENCES games(game_id)
+);
+
+
+CREATE TABLE teams (
+    team_id        INTEGER PRIMARY KEY,
+    team_name      VARCHAR(50) NOT NULL,
+    abbreviation   VARCHAR(5) NOT NULL,
+    city           VARCHAR(50),
+    conference     VARCHAR(10),   -- East / West
+    division       VARCHAR(20)
+);
+
+CREATE TABLE players (
+    player_id      INTEGER PRIMARY KEY,
+    first_name     VARCHAR(50),
+    last_name      VARCHAR(50),
+    full_name      VARCHAR(100),
+    position       VARCHAR(10),
+    height         VARCHAR(10),
+    weight         INTEGER,
+    birth_date     DATE,
+    country        VARCHAR(50),
+    draft_year     INTEGER
+);
+
+
+CREATE TABLE player_game_stats (
+    game_id        VARCHAR(20) NOT NULL,
+    team_id        INTEGER NOT NULL,
+    player_id      INTEGER NOT NULL,
+
+    starter        BOOLEAN,
+    minutes        DECIMAL(5,2),
+
+    pts            INTEGER,
+    ast            INTEGER,
+    reb            INTEGER,
+    oreb           INTEGER,
+    dreb           INTEGER,
+    stl            INTEGER,
+    blk            INTEGER,
+    tov            INTEGER,
+    pf             INTEGER,
+
+    fgm            INTEGER,
+    fga            INTEGER,
+    fg_pct         DECIMAL(5,3),
+    fg3m           INTEGER,
+    fg3a           INTEGER,
+    fg3_pct        DECIMAL(5,3),
+    ftm            INTEGER,
+    fta            INTEGER,
+    ft_pct         DECIMAL(5,3),
+
+    plus_minus     INTEGER,
+    usage_rate     DECIMAL(5,2),
+
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (game_id) REFERENCES games(game_id),
+    FOREIGN KEY (team_id) REFERENCES teams(team_id),
+    FOREIGN KEY (player_id) REFERENCES players(player_id)
+);
+
+CREATE TABLE lineup_game_stats (
+    game_id        VARCHAR(20) NOT NULL,
+    team_id        INTEGER NOT NULL,
+
+    player_1_id    INTEGER NOT NULL,
+    player_2_id    INTEGER NOT NULL,
+    player_3_id    INTEGER NOT NULL,
+    player_4_id    INTEGER NOT NULL,
+    player_5_id    INTEGER NOT NULL,
+
+    minutes        DECIMAL(5,2),
+    pts            INTEGER,
+    ast            INTEGER,
+    reb            INTEGER,
+    tov            INTEGER,
+
+    off_rating     DECIMAL(6,2),
+    def_rating     DECIMAL(6,2),
+    net_rating     DECIMAL(6,2),
+
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (
+        game_id,
+        team_id,
+        player_1_id,
+        player_2_id,
+        player_3_id,
+        player_4_id,
+        player_5_id
+    ),
+
+    FOREIGN KEY (game_id) REFERENCES games(game_id),
+    FOREIGN KEY (team_id) REFERENCES teams(team_id)
+);
+
+
+
+CREATE TABLE shot_zones_game (
+    game_id        VARCHAR(20) NOT NULL,
+    team_id        INTEGER NOT NULL,
+    player_id      INTEGER,
+
+    shot_zone_basic    VARCHAR(50),  -- Paint, Mid-Range, 3PT
+    shot_zone_area     VARCHAR(50),  -- Left Side, Center, Right
+    shot_zone_range    VARCHAR(50),  -- Less than 8 ft, 24+ ft
+
+    fgm                INTEGER,
+    fga                INTEGER,
+    fg_pct             DECIMAL(5,3),
+
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (
+        game_id,
+        team_id,
+        player_id,
+        shot_zone_basic,
+        shot_zone_area,
+        shot_zone_range
+    ),
+
+    FOREIGN KEY (game_id) REFERENCES games(game_id),
+    FOREIGN KEY (team_id) REFERENCES teams(team_id),
+    FOREIGN KEY (player_id) REFERENCES players(player_id)
+);
+
+
+CREATE TABLE conference_standings (
+    snapshot_date      DATE NOT NULL,
+    season             VARCHAR(9) NOT NULL, 
+    team_id             INTEGER NOT NULL,
+    conference          VARCHAR(10) NOT NULL, 
+    division            VARCHAR(20),
+
+    conference_rank     INTEGER,
+    division_rank       INTEGER,
+
+    wins                INTEGER,
+    losses              INTEGER,
+    win_pct             DECIMAL(5,3),
+
+    games_back          DECIMAL(4,1),
+    home_record         VARCHAR(10),   
+    road_record         VARCHAR(10),   
+
+    streak              VARCHAR(10),   
+    last_10             VARCHAR(10),  
+
+    points_for          INTEGER,
+    points_against      INTEGER,
+    point_diff          INTEGER,
+
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (snapshot_date, team_id),
+    FOREIGN KEY (team_id) REFERENCES teams(team_id)
+);
