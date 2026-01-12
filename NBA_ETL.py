@@ -9,7 +9,6 @@ from nba_api.stats.endpoints import (
     leaguegamefinder,
     boxscoretraditionalv2,
     boxscoreadvancedv2,
-    boxscorematchups,
     shotchartdetail,
     leaguestandingsv3,
     commonplayerinfo
@@ -21,10 +20,12 @@ import pandas as pd
 from typing import List, Dict, Any, Optional
 import logging
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from specific file
+env_path = Path(__file__).parent / 'rdsAuthenticator.env'
+load_dotenv(env_path)
 
 # Configure logging
 logging.basicConfig(
@@ -50,10 +51,10 @@ class NBAETLPipeline:
         """
         if db_config is None:
             db_config = {
-                'host': os.getenv('DB_HOST', 'localhost'),
-                'database': os.getenv('DB_NAME', 'nba_stats'),
-                'user': os.getenv('DB_USER', 'postgres'),
-                'password': os.getenv('DB_PASSWORD', ''),
+                'host': os.getenv('DB_HOST'),
+                'database': os.getenv('DB_NAME'),
+                'user': os.getenv('DB_USER'),
+                'password': os.getenv('DB_PASSWORD'),
                 'port': int(os.getenv('DB_PORT', 5432))
             }
         
@@ -213,12 +214,12 @@ class NBAETLPipeline:
     # GAMES DATA
     # ========================
     
-    def extract_games(self, season: str = '2024-25', season_type: str = 'Regular Season'):
+    def extract_games(self, season: str = '2025-26', season_type: str = 'Regular Season'):
         """
         Extract games for a specific season
         
         Args:
-            season: NBA season (e.g., '2024-25')
+            season: NBA season (e.g., '2025-26')
             season_type: 'Regular Season', 'Playoffs', or 'Pre Season'
         """
         logger.info(f"Extracting games for {season} {season_type}...")
@@ -491,7 +492,7 @@ class NBAETLPipeline:
                 player_id=player_id,
                 game_id_nullable=game_id,
                 context_measure_simple='FGA',
-                season_nullable='2024-25',
+                season_nullable='2025-26',
                 season_type_nullable='Regular Season'
             )
             
@@ -553,7 +554,7 @@ class NBAETLPipeline:
     # CONFERENCE STANDINGS
     # ========================
     
-    def extract_and_load_standings(self, season: str = '2024-25'):
+    def extract_and_load_standings(self, season: str = '2025-26'):
         """Extract and load current conference standings"""
         try:
             logger.info(f"Extracting standings for {season}...")
@@ -642,7 +643,7 @@ class NBAETLPipeline:
     
     def run_full_etl(
         self, 
-        season: str = '2024-25', 
+        season: str = '2025-26', 
         date_from: str = None, 
         date_to: str = None,
         include_shot_zones: bool = False,
@@ -652,7 +653,7 @@ class NBAETLPipeline:
         Run complete ETL pipeline
         
         Args:
-            season: NBA season (e.g., '2024-25')
+            season: NBA season (e.g., '2025-26')
             date_from: Start date (YYYY-MM-DD format)
             date_to: End date (YYYY-MM-DD format)
             include_shot_zones: If True, load shot zone data (SLOW!)
@@ -724,7 +725,7 @@ class NBAETLPipeline:
         finally:
             self.disconnect()
     
-    def run_incremental_update(self, season: str = '2024-25', days_back: int = 1):
+    def run_incremental_update(self, season: str = '2025-26', days_back: int = 1):
         """
         Run incremental update for recent games
         
@@ -766,20 +767,20 @@ if __name__ == "__main__":
     
     # === OPTION 1: Full season load (SLOW - multiple hours) ===
     # pipeline.run_full_etl(
-    #     season='2024-25',
+    #     season='2025-26',
     #     include_shot_zones=False,  # Set to True for shot data (VERY slow)
     #     enrich_players=False       # Set to True for player details (VERY slow)
     # )
     
     # === OPTION 2: Load specific date range ===
     # pipeline.run_full_etl(
-    #     season='2024-25',
+    #     season='2025-26',
     #     date_from='2025-01-01',
     #     date_to='2025-01-10'
     # )
     
     # === OPTION 3: Incremental daily update (recommended for automation) ===
-    pipeline.run_incremental_update(season='2024-25', days_back=1)
+    pipeline.run_incremental_update(season='2025-26', days_back=1)
     
     # === OPTION 4: Custom configuration ===
     # custom_db_config = {
@@ -789,4 +790,9 @@ if __name__ == "__main__":
     #     'password': 'password',
     #     'port': 5432
     # }
-    # custom_pipeline = NBAETLPipeline(db_config
+    # custom_pipeline = NBAETLPipeline(db_config)
+
+
+
+
+
