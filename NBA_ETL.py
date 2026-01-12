@@ -1,6 +1,6 @@
 """
 NBA ETL Pipeline - Extract data from NBA API and load to AWS Database
-Install required packages: pip install nba_api psycopg2-binary boto3 pandas
+Install required packages: pip install nba_api psycopg2-binary boto3 pandas python-dotenv
 """
 
 import psycopg2
@@ -9,38 +9,54 @@ from nba_api.stats.endpoints import (
     leaguegamefinder,
     boxscoretraditionalv2,
     boxscoreadvancedv2,
+    boxscorematchups,
     shotchartdetail,
     leaguestandingsv3,
-    commonteamroster,
     commonplayerinfo
 )
 from nba_api.stats.static import teams, players as static_players
 from datetime import datetime, timedelta
 import time
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('nba_etl.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
 class NBAETLPipeline:
     """ETL Pipeline for NBA data to AWS Database"""
     
-    def __init__(self, db_config: Dict[str, str]):
+    def __init__(self, db_config: Optional[Dict[str, str]] = None):
         """
         Initialize the ETL pipeline
         
         Args:
-            db_config: Database connection parameters
-                - host: Database host
-                - database: Database name
-                - user: Database user
-                - password: Database password
-                - port: Database port (default 5432)
+            db_config: Database connection parameters or None to use environment variables
         """
+        if db_config is None:
+            db_config = {
+                'host': os.getenv('DB_HOST', 'localhost'),
+                'database': os.getenv('DB_NAME', 'nba_stats'),
+                'user': os.getenv('DB_USER', 'postgres'),
+                'password': os.getenv('DB_PASSWORD', ''),
+                'port': int(os.getenv('DB_PORT', 5432))
+            }
+        
         self.db_config = db_config
         self.conn = None
         self.cursor = None
@@ -118,28 +134,76 @@ class NBAETLPipeline:
         nba_players = static_players.get_active_players()
         return nba_players
     
-    def load_players(self, players_data: List[Dict[str, Any]]):
-        """Load players into database"""
+    def enrich_player_data(self, player_id: int) -> Dict[str, Any]:
+        """Get detailed player information from NBA API"""
+        try:
+            player_info = commonplayerinfo.CommonPlayerInfo(player_id=player_id)
+            df = player_info.get_data_frames()[0]
+            self.rate_limit_delay()
+            
+            if len(df) > 0:
+                row = df.iloc[0]
+                return {
+                    'position': row.get('POSITION', None),
+                    'height': row.get('HEIGHT', None),
+                    'weight': row.get('WEIGHT', None),
+                    'birth_date': row.get('BIRTHDATE', None),
+                    'country': row.get('COUNTRY', None),
+                    'draft_year': row.get('DRAFT_YEAR', None)
+                }
+        except Exception as e:
+            logger.warning(f"Could not enrich player {player_id}: {e}")
+        
+        return {}
+    
+    def load_players(self, players_data: List[Dict[str, Any]], enrich: bool = False):
+        """
+        Load players into database
+        
+        Args:
+            players_data: List of player dictionaries
+            enrich: If True, fetch detailed info for each player (slow!)
+        """
         logger.info(f"Loading {len(players_data)} players...")
         
         insert_query = """
-            INSERT INTO players (player_id, first_name, last_name, full_name)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO players (
+                player_id, first_name, last_name, full_name,
+                position, height, weight, birth_date, country, draft_year
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (player_id) DO UPDATE SET
                 first_name = EXCLUDED.first_name,
                 last_name = EXCLUDED.last_name,
-                full_name = EXCLUDED.full_name
+                full_name = EXCLUDED.full_name,
+                position = EXCLUDED.position,
+                height = EXCLUDED.height,
+                weight = EXCLUDED.weight,
+                birth_date = EXCLUDED.birth_date,
+                country = EXCLUDED.country,
+                draft_year = EXCLUDED.draft_year
         """
         
-        data = [
-            (
+        data = []
+        for i, player in enumerate(players_data, 1):
+            if enrich:
+                logger.info(f"Enriching player {i}/{len(players_data)}: {player['full_name']}")
+                enriched = self.enrich_player_data(player['id'])
+            else:
+                enriched = {}
+            
+            data.append((
                 player['id'],
                 player.get('first_name', ''),
                 player.get('last_name', ''),
-                player['full_name']
-            )
-            for player in players_data
-        ]
+                player['full_name'],
+                enriched.get('position', None),
+                enriched.get('height', None),
+                enriched.get('weight', None),
+                enriched.get('birth_date', None),
+                enriched.get('country', None),
+                enriched.get('draft_year', None)
+            ))
         
         execute_batch(self.cursor, insert_query, data)
         self.conn.commit()
@@ -172,7 +236,7 @@ class NBAETLPipeline:
     
     def load_games(self, games_df: pd.DataFrame, season: str):
         """Load games into database"""
-        logger.info(f"Loading games...")
+        logger.info(f"Processing games for loading...")
         
         # Group by game to get both teams' data
         games_dict = {}
@@ -208,19 +272,20 @@ class NBAETLPipeline:
         data = []
         for game_id, game_info in games_dict.items():
             if len(game_info['teams']) == 2:
-                home_team = next(t for t in game_info['teams'] if t['is_home'])
-                away_team = next(t for t in game_info['teams'] if not t['is_home'])
+                home_team = next((t for t in game_info['teams'] if t['is_home']), None)
+                away_team = next((t for t in game_info['teams'] if not t['is_home']), None)
                 
-                data.append((
-                    game_id,
-                    game_info['game_date'],
-                    game_info['season'],
-                    home_team['team_id'],
-                    away_team['team_id'],
-                    home_team['pts'],
-                    away_team['pts'],
-                    'Final'
-                ))
+                if home_team and away_team:
+                    data.append((
+                        game_id,
+                        game_info['game_date'],
+                        game_info['season'],
+                        home_team['team_id'],
+                        away_team['team_id'],
+                        home_team['pts'],
+                        away_team['pts'],
+                        'Final'
+                    ))
         
         execute_batch(self.cursor, insert_query, data)
         self.conn.commit()
@@ -244,7 +309,11 @@ class NBAETLPipeline:
             self.rate_limit_delay()
             
             # Merge dataframes
-            merged_df = pd.merge(trad_df, adv_df, on=['GAME_ID', 'TEAM_ID'], suffixes=('', '_adv'))
+            merged_df = pd.merge(
+                trad_df, adv_df, 
+                on=['GAME_ID', 'TEAM_ID'], 
+                suffixes=('', '_adv')
+            )
             
             # Get home/away info from games table
             self.cursor.execute("""
@@ -255,6 +324,7 @@ class NBAETLPipeline:
             
             result = self.cursor.fetchone()
             if not result:
+                logger.warning(f"Game {game_id} not found in database")
                 return
             
             home_team_id, away_team_id = result
@@ -271,7 +341,11 @@ class NBAETLPipeline:
                     pts = EXCLUDED.pts,
                     ast = EXCLUDED.ast,
                     reb = EXCLUDED.reb,
-                    plus_minus = EXCLUDED.plus_minus
+                    plus_minus = EXCLUDED.plus_minus,
+                    pace = EXCLUDED.pace,
+                    off_rating = EXCLUDED.off_rating,
+                    def_rating = EXCLUDED.def_rating,
+                    net_rating = EXCLUDED.net_rating
             """
             
             data = []
@@ -312,7 +386,8 @@ class NBAETLPipeline:
             self.conn.commit()
             
         except Exception as e:
-            logger.error(f"Error processing game {game_id}: {e}")
+            logger.error(f"Error processing team stats for game {game_id}: {e}")
+            self.conn.rollback()
     
     # ========================
     # PLAYER GAME STATS
@@ -321,31 +396,51 @@ class NBAETLPipeline:
     def extract_and_load_player_game_stats(self, game_id: str):
         """Extract and load player stats for a specific game"""
         try:
+            # Get traditional box score
             boxscore = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=game_id)
             players_df = boxscore.get_data_frames()[0]  # Player stats
             self.rate_limit_delay()
+            
+            # Get advanced box score for usage rate
+            adv_boxscore = boxscoreadvancedv2.BoxScoreAdvancedV2(game_id=game_id)
+            adv_df = adv_boxscore.get_data_frames()[0]  # Player advanced stats
+            self.rate_limit_delay()
+            
+            # Merge traditional and advanced stats
+            merged_df = pd.merge(
+                players_df, 
+                adv_df[['PLAYER_ID', 'USG_PCT']], 
+                on='PLAYER_ID', 
+                how='left'
+            )
             
             insert_query = """
                 INSERT INTO player_game_stats (
                     game_id, team_id, player_id, starter, minutes, pts, ast, reb,
                     oreb, dreb, stl, blk, tov, pf, fgm, fga, fg_pct, fg3m, fg3a,
-                    fg3_pct, ftm, fta, ft_pct, plus_minus
+                    fg3_pct, ftm, fta, ft_pct, plus_minus, usage_rate
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (game_id, team_id, player_id) DO UPDATE SET
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (game_id, player_id) DO UPDATE SET
                     pts = EXCLUDED.pts,
-                    minutes = EXCLUDED.minutes
+                    minutes = EXCLUDED.minutes,
+                    ast = EXCLUDED.ast,
+                    reb = EXCLUDED.reb,
+                    usage_rate = EXCLUDED.usage_rate
             """
             
             data = []
-            for _, row in players_df.iterrows():
+            for _, row in merged_df.iterrows():
                 if row['PLAYER_ID']:  # Skip team totals
-                    # Parse minutes (format: MM:SS)
+                    # Parse minutes (format: MM:SS or M:SS)
                     minutes_str = str(row.get('MIN', '0:00'))
                     try:
-                        mins, secs = minutes_str.split(':')
-                        minutes = float(mins) + float(secs) / 60
+                        if ':' in minutes_str:
+                            mins, secs = minutes_str.split(':')
+                            minutes = float(mins) + float(secs) / 60
+                        else:
+                            minutes = float(minutes_str) if minutes_str else 0.0
                     except:
                         minutes = 0.0
                     
@@ -353,8 +448,8 @@ class NBAETLPipeline:
                         game_id,
                         row['TEAM_ID'],
                         row['PLAYER_ID'],
-                        row['START_POSITION'] != '',
-                        minutes,
+                        row['START_POSITION'] != '' if pd.notna(row['START_POSITION']) else False,
+                        round(minutes, 2),
                         row['PTS'],
                         row['AST'],
                         row['REB'],
@@ -373,7 +468,8 @@ class NBAETLPipeline:
                         row['FTM'],
                         row['FTA'],
                         row['FT_PCT'],
-                        row['PLUS_MINUS']
+                        row['PLUS_MINUS'],
+                        row.get('USG_PCT', None)
                     ))
             
             execute_batch(self.cursor, insert_query, data)
@@ -381,6 +477,77 @@ class NBAETLPipeline:
             
         except Exception as e:
             logger.error(f"Error processing player stats for game {game_id}: {e}")
+            self.conn.rollback()
+    
+    # ========================
+    # SHOT ZONES DATA
+    # ========================
+    
+    def extract_and_load_shot_zones(self, game_id: str, team_id: int, player_id: int):
+        """Extract and load shot zone data for a player in a game"""
+        try:
+            shot_chart = shotchartdetail.ShotChartDetail(
+                team_id=team_id,
+                player_id=player_id,
+                game_id_nullable=game_id,
+                context_measure_simple='FGA',
+                season_nullable='2024-25',
+                season_type_nullable='Regular Season'
+            )
+            
+            shots_df = shot_chart.get_data_frames()[0]
+            self.rate_limit_delay(1.0)  # Longer delay for shot chart API
+            
+            if len(shots_df) == 0:
+                return
+            
+            # Aggregate by shot zones
+            zone_stats = shots_df.groupby([
+                'SHOT_ZONE_BASIC', 
+                'SHOT_ZONE_AREA', 
+                'SHOT_ZONE_RANGE'
+            ]).agg({
+                'SHOT_MADE_FLAG': ['sum', 'count']
+            }).reset_index()
+            
+            zone_stats.columns = ['zone_basic', 'zone_area', 'zone_range', 'fgm', 'fga']
+            zone_stats['fg_pct'] = zone_stats['fgm'] / zone_stats['fga']
+            
+            insert_query = """
+                INSERT INTO shot_zones_game (
+                    game_id, team_id, player_id, shot_zone_basic, 
+                    shot_zone_area, shot_zone_range, fgm, fga, fg_pct
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (game_id, team_id, player_id, shot_zone_basic, 
+                           shot_zone_area, shot_zone_range) 
+                DO UPDATE SET
+                    fgm = EXCLUDED.fgm,
+                    fga = EXCLUDED.fga,
+                    fg_pct = EXCLUDED.fg_pct
+            """
+            
+            data = [
+                (
+                    game_id,
+                    team_id,
+                    player_id,
+                    row['zone_basic'],
+                    row['zone_area'],
+                    row['zone_range'],
+                    int(row['fgm']),
+                    int(row['fga']),
+                    round(row['fg_pct'], 3)
+                )
+                for _, row in zone_stats.iterrows()
+            ]
+            
+            execute_batch(self.cursor, insert_query, data)
+            self.conn.commit()
+            
+        except Exception as e:
+            logger.error(f"Error processing shot zones for player {player_id} in game {game_id}: {e}")
+            self.conn.rollback()
     
     # ========================
     # CONFERENCE STANDINGS
@@ -412,7 +579,11 @@ class NBAETLPipeline:
                 ON CONFLICT (snapshot_date, team_id) DO UPDATE SET
                     wins = EXCLUDED.wins,
                     losses = EXCLUDED.losses,
-                    win_pct = EXCLUDED.win_pct
+                    win_pct = EXCLUDED.win_pct,
+                    conference_rank = EXCLUDED.conference_rank,
+                    games_back = EXCLUDED.games_back,
+                    streak = EXCLUDED.streak,
+                    last_10 = EXCLUDED.last_10
             """
             
             data = []
@@ -423,7 +594,7 @@ class NBAETLPipeline:
                     row['TeamID'],
                     row['Conference'],
                     row.get('Division', ''),
-                    row['ConferenceRecord'].split('-')[0] if 'ConferenceRecord' in row else None,
+                    row.get('ConferenceRank', None),
                     row.get('DivisionRank', None),
                     row['WINS'],
                     row['LOSSES'],
@@ -437,16 +608,46 @@ class NBAETLPipeline:
             
             execute_batch(self.cursor, insert_query, data)
             self.conn.commit()
-            logger.info("Standings loaded successfully")
+            logger.info(f"Loaded standings for {len(data)} teams")
             
         except Exception as e:
             logger.error(f"Error loading standings: {e}")
+            self.conn.rollback()
+    
+    # ========================
+    # UTILITY METHODS
+    # ========================
+    
+    def get_games_to_process(self, season: str, date_from: str = None, date_to: str = None) -> List[str]:
+        """Get list of game IDs to process based on date filters"""
+        query = "SELECT DISTINCT game_id FROM games WHERE season = %s"
+        params = [season]
+        
+        if date_from:
+            query += " AND game_date >= %s"
+            params.append(date_from)
+        
+        if date_to:
+            query += " AND game_date <= %s"
+            params.append(date_to)
+        
+        query += " ORDER BY game_id"
+        
+        self.cursor.execute(query, params)
+        return [row[0] for row in self.cursor.fetchall()]
     
     # ========================
     # MAIN ETL ORCHESTRATION
     # ========================
     
-    def run_full_etl(self, season: str = '2024-25', date_from: str = None, date_to: str = None):
+    def run_full_etl(
+        self, 
+        season: str = '2024-25', 
+        date_from: str = None, 
+        date_to: str = None,
+        include_shot_zones: bool = False,
+        enrich_players: bool = False
+    ):
         """
         Run complete ETL pipeline
         
@@ -454,6 +655,8 @@ class NBAETLPipeline:
             season: NBA season (e.g., '2024-25')
             date_from: Start date (YYYY-MM-DD format)
             date_to: End date (YYYY-MM-DD format)
+            include_shot_zones: If True, load shot zone data (SLOW!)
+            enrich_players: If True, fetch detailed player info (SLOW!)
         """
         try:
             self.connect()
@@ -466,7 +669,7 @@ class NBAETLPipeline:
             # 2. Load players
             logger.info("=== STEP 2: Loading Players ===")
             players_data = self.extract_players()
-            self.load_players(players_data)
+            self.load_players(players_data, enrich=enrich_players)
             
             # 3. Load games
             logger.info("=== STEP 3: Loading Games ===")
@@ -489,8 +692,26 @@ class NBAETLPipeline:
                 self.extract_and_load_team_game_stats(game_id)
                 self.extract_and_load_player_game_stats(game_id)
             
-            # 5. Load standings
-            logger.info("=== STEP 5: Loading Standings ===")
+            # 5. Load shot zones (optional - very slow!)
+            if include_shot_zones:
+                logger.info("=== STEP 5: Loading Shot Zones ===")
+                
+                # Get all player-game combinations
+                self.cursor.execute("""
+                    SELECT DISTINCT game_id, team_id, player_id 
+                    FROM player_game_stats 
+                    WHERE game_id = ANY(%s)
+                    AND minutes > 0
+                """, (list(unique_games),))
+                
+                player_games = self.cursor.fetchall()
+                
+                for i, (game_id, team_id, player_id) in enumerate(player_games, 1):
+                    logger.info(f"Processing shot zones {i}/{len(player_games)}")
+                    self.extract_and_load_shot_zones(game_id, team_id, player_id)
+            
+            # 6. Load standings
+            logger.info("=== STEP 6: Loading Standings ===")
             self.extract_and_load_standings(season)
             
             logger.info("=== ETL COMPLETE ===")
@@ -502,40 +723,70 @@ class NBAETLPipeline:
             raise
         finally:
             self.disconnect()
+    
+    def run_incremental_update(self, season: str = '2024-25', days_back: int = 1):
+        """
+        Run incremental update for recent games
+        
+        Args:
+            season: NBA season
+            days_back: Number of days to look back
+        """
+        date_from = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+        date_to = datetime.now().strftime('%Y-%m-%d')
+        
+        logger.info(f"Running incremental update from {date_from} to {date_to}")
+        
+        self.run_full_etl(
+            season=season,
+            date_from=date_from,
+            date_to=date_to,
+            include_shot_zones=False,
+            enrich_players=False
+        )
 
 
 # ========================
-# USAGE EXAMPLE
+# USAGE EXAMPLES
 # ========================
 
 if __name__ == "__main__":
-    # Database configuration for AWS RDS
-    db_config = {
-        'host': 'your-rds-endpoint.rds.amazonaws.com',
-        'database': 'nba_stats',
-        'user': 'your_username',
-        'password': 'your_password',
-        'port': 5432
-    }
+    """
+    Create a .env file with your database credentials:
     
-    # Initialize pipeline
-    pipeline = NBAETLPipeline(db_config)
+    DB_HOST=your-rds-endpoint.rds.amazonaws.com
+    DB_NAME=nba_stats
+    DB_USER=your_username
+    DB_PASSWORD=your_password
+    DB_PORT=5432
+    """
     
-    # Run full ETL for current season
-    # Option 1: Load entire season
-    pipeline.run_full_etl(season='2024-25')
+    # Initialize pipeline (uses .env file)
+    pipeline = NBAETLPipeline()
     
-    # Option 2: Load specific date range
+    # === OPTION 1: Full season load (SLOW - multiple hours) ===
     # pipeline.run_full_etl(
     #     season='2024-25',
-    #     date_from='2024-12-01',
-    #     date_to='2024-12-31'
+    #     include_shot_zones=False,  # Set to True for shot data (VERY slow)
+    #     enrich_players=False       # Set to True for player details (VERY slow)
     # )
     
-    # Option 3: Incremental load (yesterday's games)
-    # yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    # === OPTION 2: Load specific date range ===
     # pipeline.run_full_etl(
     #     season='2024-25',
-    #     date_from=yesterday,
-    #     date_to=yesterday
+    #     date_from='2025-01-01',
+    #     date_to='2025-01-10'
     # )
+    
+    # === OPTION 3: Incremental daily update (recommended for automation) ===
+    pipeline.run_incremental_update(season='2024-25', days_back=1)
+    
+    # === OPTION 4: Custom configuration ===
+    # custom_db_config = {
+    #     'host': 'localhost',
+    #     'database': 'nba_dev',
+    #     'user': 'postgres',
+    #     'password': 'password',
+    #     'port': 5432
+    # }
+    # custom_pipeline = NBAETLPipeline(db_config
